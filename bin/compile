@@ -20,29 +20,50 @@ JQ_SOURCE_DIR="$BUILD_DIR/.heroku/vendor/jq" # where the jq source code will be
 JQ_BUILD_DIR="$BUILD_DIR/vendor/jq" # where the jq binaries will be stored (in subdirectories) during buildpack execution
  # Single quotes since we want $HOME to be resolved at runtime, not build time.
 JQ_HOME_DIR='$HOME/vendor/jq' # where the jq binaries will be stored (in subdirectories) during dyno execution
+ONIGMO_LIB_DIR='$HOME/onigmo/lib'
 JQ_CACHE_DIR="$CACHE_DIR/vendor/jq" # where the jq binaries will be cached (in subdirectories)
 PROFILE_DIR="$BUILD_DIR/.profile.d"
 PROFILE_PATH="$PROFILE_DIR/jq.sh"
 
-echo "-----> Installing jq@1.6 with oniguruma support"
+echo "-----> Installing dependencies for jq support"
 
-# fetch and compile jq with oniguruma support, unless its in the cache 
 if [ -d "$JQ_CACHE_DIR" ]; then
   echo "jq already compiled - found in cache" | indent
 else
-  echo "fetching and compiling jq" | indent
-  
-  curl -OLs https://github.com/stedolan/jq/releases/download/jq-1.6/jq-1.6.tar.gz
- 
+  echo "fetching and compiling Onigmo (regex library)"
+  # We install Onigmo (forked from Oniguruma) to work around this issue in ruby-jq
+  # https://github.com/winebarrel/ruby-jq/issues/14
+  #
+  # Voke-jq claims to do this by default but I couldn't get it working unless I built
+  # and installed Onigmo myself
+  curl -OLs https://github.com/k-takata/Onigmo/archive/refs/tags/Onigmo-6.2.0.tar.gz
+  mkdir -p /tmp/Onigmo/
+  tar -C /tmp/Onigmo -xf Onigmo-6.2.0.tar.gz
+  pushd /tmp/Onigmo/Onigmo-Onigmo-6.2.0/
+  ./autogen.sh |& indent
+  # /usr/local/bin/ is read-only in buildpacks. Must install to somewhere else
+  # cannot create regular file '/usr/local/bin/onigmo-config': Read-only file system
+  ONGIMO_PATH=$JQ_CACHE_DIR/usr/local/
+  mkdir -p $ONGIMO_PATH
+  ./configure --prefix=$ONGIMO_PATH |& indent
+  make --silent |& indent
+  make install |& indent
+  popd |& indent
+
+  echo "fetching and compiling jq" |& indent
+  # A fork of jq that can use Onigmo
+  # Cannot use release 1.6 due to a bug when installing with onigmo from non-default location
+  # It's fixed in master. We peg a commit for the sake of repeatable builds
   mkdir -p $JQ_SOURCE_DIR
   mkdir -p $JQ_CACHE_DIR
-
-  tar -C $JQ_SOURCE_DIR -xf jq-1.6.tar.gz
-  cd $JQ_SOURCE_DIR/jq-1.6
-  autoreconf -fi |& indent # according to README, we shouldn't need to do this step, but https://github.com/stedolan/jq/issues/1930#issuecomment-504115777
-  ./configure --silent --with-oniguruma=builtin --disable-maintainer-mode |& indent
-  make -s |& indent
+  pushd $JQ_SOURCE_DIR
+  git clone https://github.com/voke/jq.git . |& indent
+  git checkout 7893d2bf4663089ad508c311a02a9461a33f7fc0 |& indent
+  autoreconf -fi |& indent
+  ./configure --disable-docs --disable-maintainer-mode --with-oniguruma=$ONGIMO_PATH |& indent
+  make --silent |& indent
   make install DESTDIR=$JQ_CACHE_DIR |& indent
+  popd |& indent
 fi
 
 # at this point, we know the binaries are in the cache.
@@ -62,12 +83,20 @@ export CPATH=\${CPATH:+\${CPATH}:}$1/include
 EOF
 }
 
-# append $JQ_BUILD_DIR subdirectories to appropriate env variables for dynos 
+# append $JQ_BUILD_DIR subdirectories to appropriate env variables for dynos
 mkdir -p $PROFILE_DIR
 config_var_definitions $JQ_HOME_DIR $PROFILE_PATH
 
-# append $JQ_BUILD_DIR subdirectories to appropriate env variables for subsequent buildpacks (i.e. when bundle installing) 
+# append $JQ_BUILD_DIR subdirectories to appropriate env variables for subsequent buildpacks (i.e. when bundle installing)
 config_var_definitions $JQ_BUILD_DIR $BP_DIR/export
 
-echo "Done installing jq" | indent
+echo "Verifying jq..." | indent
+# Sanity check that jq is using Onigmo
+libraries=$(ldd $JQ_CACHE_DIR/usr/local/bin/jq)
+match=$(echo ${libraries} | grep -o "libonig.so" || true)
+if [[ -n "${match}" ]]; then
+  echo "Error: jq is using system-default regex library Oniguruma! It should be using Onigmo"
+  false
+fi
 
+echo "Done installing jq" | indent
